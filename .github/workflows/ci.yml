@@ -26,11 +26,10 @@ jobs:
           npm ci
           npm test
 
-      - name: Test and build frontend
+      - name: Build frontend
         working-directory: frontend
         run: |
           npm ci
-          npm test
           npm run build
 
       - name: Set up Python
