@@ -17,6 +17,6 @@ requests>=2.31.0
 
 # TrOCR – Microsoft handwriting OCR via HuggingFace
 # Models download on first run (~360 MB, cached in ~/.cache/huggingface)
-transformers>=4.38.0
+transformers>=4.40.0
 torch>=2.2.0          # CPU-only wheels are fine: pip install torch --index-url https://download.pytorch.org/whl/cpu
 sentencepiece>=0.2.0

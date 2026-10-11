@@ -1,0 +1,10 @@
+.env
+.env.*
+.venv
+__pycache__
+*.py[cod]
+*.log
+dataset
+test_*.py
+benchmark_ocr.py
+synthetic_generator.py
