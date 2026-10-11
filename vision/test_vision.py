@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+from contextlib import nullcontext
 import io
 import json
 import unittest
@@ -88,7 +89,14 @@ class VisionTests(unittest.TestCase):
                 }]
 
         model = Mock(return_value=Mock())
-        with patch.object(main, "_get_grounding_dino", return_value=(FakeProcessor(), model, "cpu")):
+        with (
+            patch.dict("sys.modules", {"torch": Mock(inference_mode=nullcontext)}),
+            patch.object(
+                main,
+                "_get_grounding_dino",
+                return_value=(FakeProcessor(), model, "cpu"),
+            ),
+        ):
             regions = main._grounding_dino_detect(self.image_base64())
 
         self.assertEqual(len(regions), 2)
