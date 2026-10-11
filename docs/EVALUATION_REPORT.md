@@ -1,73 +1,58 @@
-# BoardSnap - Evaluation Report & Benchmarks
-**Banana Hacks 2026 | Theme: Image AI**  
-**Team: Ammar, Muavia, Moyeon, Awais**  
-*Evaluation Date: October 11–12, 2026*
+# BoardSnap Implementation and Evaluation Status
 
----
+**Last checked:** October 11, 2026
+**Status:** Local code checks pass; live end-to-end processing and model accuracy are not verified.
 
-## 1. Why BoardSnap is NOT a Thin API Wrapper
-Judges consistently score API wrappers low. BoardSnap features three core technical components built, fine-tuned, and measured by our team:
-1. **Custom Region & Shape Detector**: Fine-tuned on whiteboard primitives (text, boxes, circles, arrows, tables) to isolate diagrams from freeform handwritten notes.
-2. **Spatial Graph Builder**: A geometric association engine that links arrow endpoints to adjacent shapes, infers flowchart directionality, and synthesizes clean Mermaid ASTs and SVG graphics.
-3. **Rigorous Empirical Benchmark**: Evaluated on our proprietary 40-board dataset (10 from each teammate) with 15 held-out photos never seen during development.
+## Evidence-based implementation status
 
----
+| Component | What is in this checkout | Verification and limitation |
+| --- | --- | --- |
+| Frontend | React/Vite upload UI and API client | Production build passes. Uploaded images use the backend; sample cards are preset previews, not live inference. |
+| Backend | Express API orchestrates cleanup, detection, OCR, graph, notes, and quiz stages | Four backend pipeline/API tests pass. The local run used in-memory storage; MongoDB persistence is now described in Docker Compose but has not been run here. |
+| Image cleanup | OpenCV-based cleanup and quality scoring | Synthetic smoke checks pass. This is not a real-photo quality or OCR benchmark. |
+| Region detector | Local OpenCV geometry/line heuristics by default; optional Grounding DINO or hosted Roboflow | Synthetic shape/connector tests pass. Real-photo performance and detection recall have not been measured; OpenCV heuristics are not a trained detector. |
+| Handwriting OCR | Loads Microsoft's pretrained `microsoft/trocr-base-handwritten` checkpoint on demand | The project has not fine-tuned TrOCR. The last Vision health check reported the model unloaded; unit tests mock recognition. Real OCR output and accuracy are unverified. |
+| Diagram graph | Spatial heuristic connects detected shapes and arrows and emits Mermaid | Synthetic graph tests pass; no labeled real-image graph benchmark is present. |
+| Notes, quiz, and chat | Gemini-backed generation uses supplied board evidence | The last LLM health check reported no Gemini key configured. Live generation and grounding quality have not been verified. |
 
-## 2. Evaluation Dataset Profile
-- **Total whiteboards captured**: 40
-- **Team split**: 10 from Ammar, 10 from Muavia, 10 from Moyeon, 10 from Awais.
-- **Held-out test split**: 15 photos (37.5% of total dataset reserved strictly for blind evaluation).
-- **Environmental diversity**:
-  - Viewing angles: 0° to 30° skew.
-  - Lighting: Fluorescent labs, direct sunlight, window backlighting, specular camera flash reflection.
-  - Marker conditions: Bold dark markers, faded dry-erase markers, multi-colored pens.
+## Model training and dataset
 
----
+- No project-trained YOLO/model weight files are tracked in this repository.
+- No project-trained detector is included. Grounding DINO is an optional,
+  upstream pretrained zero-shot model; Roboflow is also optional.
+- TrOCR is an upstream pretrained checkpoint; there is no project fine-tuning
+  code, training run, or trained checkpoint in this checkout.
+- `dataset/manifest.json` records `not_downloaded`. The downloader's target
+  datasets contain region annotations, not transcribed text for OCR training.
+- No held-out image/transcription manifest or reproducible real-image
+  evaluation is checked in.
 
-## 3. Comprehensive Metric Summary Table
+**Verified model accuracy figures: none.** Previous accuracy, latency, dataset
+size, and hallucination-rate figures in project materials lacked supporting
+evaluation artifacts and have been removed. Do not present them as measured
+results.
 
-| Evaluation Dimension | Metric Evaluated | Result | Benchmark Target | Status |
-| :--- | :--- | :--- | :--- | :--- |
-| **Board Cleanup & Rectification** | Mean 4-corner Quad IoU | **91.4%** | >85.0% | Pass |
-| **Quality Gate Filtering** | False Acceptance of Blurry/Glare Boards | **4.2%** | <10.0% | Pass |
-| **Region Detector (Text Blocks)** | Precision / Recall / F1 | **92.4% / 90.8% / 0.916** | >85% F1 | Pass |
-| **Region Detector (Boxes / Shapes)** | Precision / Recall / F1 | **89.1% / 87.5% / 0.883** | >80% F1 | Pass |
-| **Region Detector (Connector Arrows)** | Precision / Recall / F1 | **84.7% / 81.2% / 0.829** | >80% F1 | Pass |
-| **Handwriting OCR Engine** | Word Accuracy Rate (WAR) | **86.4%** (TrOCR + Lexicon) | >80.0% | Pass |
-| **Flowchart Node Extraction** | Rebuilt Node Recall | **93.3%** (56/60 nodes) | >90.0% | Pass |
-| **Flowchart Edge Association** | Directed Edge Association Accuracy | **88.0%** (44/50 edges) | >80.0% | Pass |
-| **Mermaid AST Syntax** | Valid Syntax Compilation Rate | **97.5%** | >95.0% | Pass |
-| **Note Grounding & Truthfulness** | Hallucination / Unsupported Line Rate | **0.0%** (0 / 20 reviewed) | 0.0% | Perfect |
-| **End-to-End Speed** | Mean Pipeline Latency | **4.8 seconds** | <8.0s | Real-time |
+## Checks run
 
----
+- Backend contract tests: 4 passed.
+- Vision unit tests: 12 passed; external inference and OCR were mocked.
+- Vision smoke checks: 4 passed; OCR was mocked.
+- Frontend API failure tests: 3 passed.
+- Frontend production build: passed, with a large JavaScript chunk warning.
+- Docker Compose YAML structure parses. Docker itself was unavailable locally,
+  so container builds and runtime health have not been verified.
 
-## 4. Deep-Dive Analysis
+## Required before claiming a complete live pipeline
 
-### A. Region Detector Performance (Muavia)
-Tested across 288 annotated instances on the 15 held-out test boards:
-- **Text Blocks**: Precision 92.4%, Recall 90.8%. High recall ensures bullet points and definitions are not dropped.
-- **Boxes**: Precision 89.1%, Recall 87.5%. Slight degradation when corners were drawn faintly or disconnected.
-- **Connector Arrows**: Precision 84.7%, Recall 81.2%. Curved arrows and two-way arrows showed lower precision than straight arrows.
-
-### B. Handwriting OCR Benchmark (Muavia & Awais)
-We benchmarked three OCR solutions across all 40 boards:
-1. **TrOCR + Grounded Lexicon Filter (Selected)**: **86.4% Word Accuracy**. Transfomer-based vision-language model excels on messy handwriting and cursives.
-2. **PaddleOCR (Handwriting Branch)**: **78.2% Word Accuracy**. Fast inference but struggled with slanted writing.
-3. **Standard Tesseract v5**: **61.5% Word Accuracy**. Poor performance on dry-erase marker handwriting; biased toward printed typography.
-
-### C. Graph Builder & Arrow Attachment (Muavia)
-- The spatial proximity matcher successfully associated 44 out of 50 directed flowchart edges (88.0%).
-- Primary failure mode: when diagrams contain criss-crossing lines or long diagonal arrows bypassing multiple intermediate boxes.
-
-### D. Notes Grounding & Hallucination Review (Awais)
-- Awais manually evaluated 20 processed boards line-by-line against the original board images.
-- **Invented facts / hallucinated lines: 0 out of 20 boards.**
-- The strict grounding prompt and OCR token lexical verification successfully rejected any speculative LLM extrapolation.
-
----
-
-## 5. Honest Limitations & What We Would Fix Next
-1. **Curved and criss-crossing arrows**: Current proximity heuristic assumes straight-line vector projections. Next step: add spline contour tracing via OpenCV skeletonization.
-2. **Faded dry-erase markers**: In extreme low-contrast lighting, faded green markers occasionally merged with the whiteboard background. Next step: adaptive local Otsu thresholding per image patch.
-3. **Urdu / Multi-language support**: Planned as a post-hackathon extension using multi-lingual OCR weights.
+1. Test the default OpenCV detector on representative real board images and
+   measure region recall/precision. If using Grounding DINO or Roboflow instead,
+   configure and benchmark the selected provider as well.
+2. Configure a valid Gemini key locally and verify the selected model/SDK with
+   notes, quiz, and chat requests.
+3. Load TrOCR and test representative handwritten photos against manually
+   transcribed ground truth; report CER/WER, sample count, and split protocol.
+4. If claiming a trained detector, download and document the dataset version,
+   train/fine-tune a model, preserve its reproducible configuration/checkpoint,
+   and evaluate on an untouched labeled test split.
+5. Run Docker Compose on a machine with Docker Desktop and exercise a real
+   frontend upload through every backend and model stage.

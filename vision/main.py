@@ -2,20 +2,21 @@
 BoardSnap Vision Service  –  FastAPI
 =====================================
 Owner : Muavia   |   Event : Banana Hacks 2026
-Stack : OpenCV  ·  Roboflow Inference API  ·  Microsoft TrOCR (HuggingFace)
+Stack : OpenCV region detection  ·  Microsoft TrOCR  ·  optional Grounding DINO
 
 Endpoints
 ---------
   GET  /health
   POST /vision/clean    – perspective rectification + glare suppression
-  POST /vision/detect   – Roboflow Inference whiteboard region detector
+  POST /vision/detect   – local Grounding DINO whiteboard region detector
   POST /vision/ocr      – TrOCR handwriting → typed text per region
   POST /vision/graph    – spatial arrow↔box graph → Mermaid diagram
 
 Environment variables
 ---------------------
-  ROBOFLOW_API_KEY   (required for /detect)
-  ROBOFLOW_MODEL_ID  (default: "whiteboard-ctvgi/1")
+  DETECTOR_PROVIDER   (default: "opencv"; optional "grounding-dino" or "roboflow")
+  GROUNDING_DINO_MODEL_ID (default: "IDEA-Research/grounding-dino-tiny")
+  ROBOFLOW_API_KEY    (required only for the optional Roboflow provider)
 
 Run
 ---
@@ -33,6 +34,8 @@ import math
 import os
 import time
 import importlib.util
+import inspect
+from threading import Lock
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -64,8 +67,51 @@ app.add_middleware(
 ROBOFLOW_API_KEY = os.environ.get("ROBOFLOW_API_KEY", "")
 ROBOFLOW_MODEL_ID = os.environ.get("ROBOFLOW_MODEL_ID", "whiteboard-ctvgi/1")
 ROBOFLOW_WORKFLOW_URL = os.environ.get("ROBOFLOW_WORKFLOW_URL", "").strip()
+DETECTOR_PROVIDER = os.environ.get("DETECTOR_PROVIDER", "opencv").strip().lower()
+GROUNDING_DINO_MODEL_ID = os.environ.get(
+    "GROUNDING_DINO_MODEL_ID",
+    "IDEA-Research/grounding-dino-tiny",
+)
+GROUNDING_DINO_THRESHOLD = float(os.environ.get("GROUNDING_DINO_THRESHOLD", "0.25"))
+GROUNDING_DINO_TEXT_THRESHOLD = float(os.environ.get("GROUNDING_DINO_TEXT_THRESHOLD", "0.2"))
+GROUNDING_DINO_IMAGE_SIZE = int(os.environ.get("GROUNDING_DINO_IMAGE_SIZE", "640"))
+GROUNDING_DINO_CPU_THREADS = int(os.environ.get("GROUNDING_DINO_CPU_THREADS", "1"))
+OPENCV_TEXT_CONFIDENCE = 0.7
+OPENCV_SHAPE_CONFIDENCE = 0.75
+OPENCV_ARROW_CONFIDENCE = 0.65
 ALLOW_DEMO_DETECTOR_FALLBACK = os.environ.get("ALLOW_DEMO_DETECTOR_FALLBACK", "").lower() == "true"
 TROCR_MODEL_ID = os.environ.get("TROCR_MODEL_ID", "microsoft/trocr-base-handwritten")
+
+# ── lazy local Grounding DINO loader ─────────────────────────────────────────
+_grounding_dino_processor = None
+_grounding_dino_model = None
+_grounding_dino_device = None
+_grounding_dino_lock = Lock()
+
+
+def _get_grounding_dino():
+    global _grounding_dino_processor, _grounding_dino_model, _grounding_dino_device
+    if _grounding_dino_processor is None:
+        with _grounding_dino_lock:
+            if _grounding_dino_processor is None:
+                log.info("Loading local Grounding DINO model (%s) …", GROUNDING_DINO_MODEL_ID)
+                import torch
+                from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                if device == "cpu":
+                    torch.set_num_threads(max(1, GROUNDING_DINO_CPU_THREADS))
+                processor = AutoProcessor.from_pretrained(GROUNDING_DINO_MODEL_ID)
+                model = AutoModelForZeroShotObjectDetection.from_pretrained(
+                    GROUNDING_DINO_MODEL_ID
+                ).to(device)
+                model.eval()
+                _grounding_dino_processor = processor
+                _grounding_dino_model = model
+                _grounding_dino_device = device
+                log.info("Grounding DINO loaded on %s.", device)
+    return _grounding_dino_processor, _grounding_dino_model, _grounding_dino_device
+
 
 # ── lazy TrOCR loader (loaded once on first call) ─────────────────────────────
 _trocr_processor = None
@@ -272,12 +318,424 @@ def clean_whiteboard(raw_bytes: bytes) -> Tuple[np.ndarray, dict]:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  HELPERS – ROBOFLOW INFERENCE
+#  HELPERS – LOCAL GROUNDING DINO AND OPTIONAL ROBOFLOW INFERENCE
 # ═════════════════════════════════════════════════════════════════════════════
+
+def _point_to_box_distance(point: Tuple[float, float], box: List[float]) -> float:
+    dx = max(box[0] - point[0], 0.0, point[0] - box[2])
+    dy = max(box[1] - point[1], 0.0, point[1] - box[3])
+    return math.hypot(dx, dy)
+
+
+def _pixel_region(
+    region_id: str,
+    region_type: str,
+    box: List[float],
+    image_width: int,
+    image_height: int,
+    label: str,
+    confidence: float,
+) -> RegionItem:
+    x1, y1, x2, y2 = box
+    return RegionItem(
+        id=region_id,
+        type=region_type,
+        box=[
+            round(x1 / image_width * 100, 2),
+            round(y1 / image_height * 100, 2),
+            round((x2 - x1) / image_width * 100, 2),
+            round((y2 - y1) / image_height * 100, 2),
+        ],
+        label=label,
+        confidence=confidence,
+    )
+
+
+def _opencv_detect(image_b64: str) -> List[RegionItem]:
+    """Find diagram shapes, connectors, and text lines without a remote model."""
+    if image_b64.startswith("data:") and "," in image_b64:
+        image_b64 = image_b64.split(",", 1)[1]
+    image = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
+    image_array = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(image_array, cv2.COLOR_BGR2GRAY)
+    image_height, image_width = gray.shape
+    minimum_dimension = min(image_width, image_height)
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, ink = cv2.threshold(
+        blurred,
+        0,
+        255,
+        cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU,
+    )
+
+    contours, _ = cv2.findContours(ink, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    shape_candidates: List[Tuple[float, str, List[float]]] = []
+    for contour in contours:
+        contour_area = abs(cv2.contourArea(contour))
+        perimeter = cv2.arcLength(contour, True)
+        if contour_area < image_width * image_height * 0.002 or perimeter <= 0:
+            continue
+
+        x, y, width, height = cv2.boundingRect(contour)
+        area_ratio = width * height / (image_width * image_height)
+        if (
+            area_ratio > 0.7
+            or width < max(20, round(image_width * 0.035))
+            or height < max(20, round(image_height * 0.035))
+        ):
+            continue
+
+        polygon = cv2.approxPolyDP(contour, 0.025 * perimeter, True)
+        if len(polygon) >= 6:
+            circularity = 4 * math.pi * contour_area / (perimeter * perimeter)
+            if circularity >= 0.7:
+                shape_type = "circle"
+            else:
+                continue
+        elif len(polygon) == 4 and cv2.isContourConvex(polygon):
+            center_x = x + width / 2
+            center_y = y + height / 2
+            near_side_midpoint = sum(
+                min(
+                    abs(float(point[0][0]) - center_x) / max(width, 1),
+                    abs(float(point[0][1]) - center_y) / max(height, 1),
+                ) < 0.16
+                for point in polygon
+            )
+            shape_type = "diamond" if near_side_midpoint >= 3 else "box"
+        else:
+            continue
+
+        box = [float(x), float(y), float(x + width), float(y + height)]
+        confidence = OPENCV_SHAPE_CONFIDENCE
+        if any(
+            _box_iou(box, previous_box) > 0.65
+            for _, _, previous_box in shape_candidates
+        ):
+            continue
+        shape_candidates.append((confidence, shape_type, box))
+
+    shape_candidates.sort(key=lambda item: item[0], reverse=True)
+    shape_regions = [
+        _pixel_region(
+            f"s{index + 1}",
+            shape_type,
+            box,
+            image_width,
+            image_height,
+            f"OpenCV {shape_type}",
+            confidence,
+        )
+        for index, (confidence, shape_type, box) in enumerate(shape_candidates)
+    ]
+    shape_boxes = [
+        [
+            region.box[0] * image_width / 100,
+            region.box[1] * image_height / 100,
+            (region.box[0] + region.box[2]) * image_width / 100,
+            (region.box[1] + region.box[3]) * image_height / 100,
+        ]
+        for region in shape_regions
+    ]
+
+    edges = cv2.Canny(gray, 50, 150)
+    line_segments = cv2.HoughLinesP(
+        edges,
+        1,
+        np.pi / 180,
+        threshold=max(20, round(minimum_dimension * 0.08)),
+        minLineLength=max(24, round(minimum_dimension * 0.08)),
+        maxLineGap=max(5, round(minimum_dimension * 0.025)),
+    )
+    connector_candidates: Dict[Tuple[int, int], Tuple[float, List[float]]] = {}
+    if line_segments is not None and len(shape_boxes) >= 2:
+        endpoint_tolerance = max(10.0, minimum_dimension * 0.04)
+        padding = max(3.0, minimum_dimension * 0.01)
+        for segment in np.asarray(line_segments).reshape(-1, 4):
+            x1, y1, x2, y2 = (float(value) for value in segment)
+            start = (x1, y1)
+            end = (x2, y2)
+            length = math.dist(start, end)
+            if length < max(24, minimum_dimension * 0.08):
+                continue
+            start_matches = [
+                (index, _point_to_box_distance(start, box))
+                for index, box in enumerate(shape_boxes)
+            ]
+            end_matches = [
+                (index, _point_to_box_distance(end, box))
+                for index, box in enumerate(shape_boxes)
+            ]
+            start_matches = [item for item in start_matches if item[1] <= endpoint_tolerance]
+            end_matches = [item for item in end_matches if item[1] <= endpoint_tolerance]
+            connections = [
+                (start_index, end_index)
+                for start_index, _ in start_matches
+                for end_index, _ in end_matches
+                if start_index != end_index
+            ]
+            if not connections:
+                continue
+            connection = tuple(sorted(connections[0]))
+
+            arrow_box = [
+                max(0.0, min(x1, x2) - padding),
+                max(0.0, min(y1, y2) - padding),
+                min(float(image_width), max(x1, x2) + padding),
+                min(float(image_height), max(y1, y2) + padding),
+            ]
+            previous = connector_candidates.get(connection)
+            if previous is None or length > previous[0]:
+                connector_candidates[connection] = (length, arrow_box)
+
+    arrow_boxes = [candidate[1] for candidate in connector_candidates.values()]
+
+    arrow_regions = [
+        _pixel_region(
+            f"a{index + 1}",
+            "arrow",
+            box,
+            image_width,
+            image_height,
+            "Connector",
+            OPENCV_ARROW_CONFIDENCE,
+        )
+        for index, box in enumerate(arrow_boxes)
+    ]
+
+    text_ink = ink.copy()
+    for box in shape_boxes + arrow_boxes:
+        x1, y1, x2, y2 = (int(round(value)) for value in box)
+        cv2.rectangle(
+            text_ink,
+            (max(0, x1 - 2), max(0, y1 - 2)),
+            (min(image_width - 1, x2 + 2), min(image_height - 1, y2 + 2)),
+            0,
+            thickness=-1,
+        )
+
+    row_counts = np.count_nonzero(text_ink, axis=1)
+    active_rows = np.flatnonzero(row_counts >= max(2, round(image_width * 0.005)))
+    max_row_gap = max(1, min(4, image_height // 100))
+    line_groups: List[Tuple[int, int]] = []
+    if active_rows.size:
+        start = previous = int(active_rows[0])
+        for row_value in active_rows[1:]:
+            row = int(row_value)
+            if row - previous > max_row_gap + 1:
+                line_groups.append((start, previous))
+                start = row
+            previous = row
+        line_groups.append((start, previous))
+
+    text_regions: List[RegionItem] = []
+    min_line_height = max(6, round(image_height * 0.012))
+    for top, bottom in line_groups:
+        if bottom - top + 1 < min_line_height:
+            continue
+        columns = np.flatnonzero(np.any(text_ink[top:bottom + 1], axis=0))
+        if not columns.size:
+            continue
+        pad_x = max(2, round(image_width * 0.005))
+        pad_y = max(2, round(image_height * 0.005))
+        line_box = [
+            float(max(0, int(columns[0]) - pad_x)),
+            float(max(0, top - pad_y)),
+            float(min(image_width, int(columns[-1]) + 1 + pad_x)),
+            float(min(image_height, bottom + 1 + pad_y)),
+        ]
+        if any(
+            _intersection_over_smaller_box(line_box, shape_box) > 0.8
+            for shape_box in shape_boxes
+        ):
+            continue
+        center = ((line_box[0] + line_box[2]) / 2, (line_box[1] + line_box[3]) / 2)
+        if any(
+            box[0] <= center[0] <= box[2] and box[1] <= center[1] <= box[3]
+            for box in shape_boxes
+        ):
+            continue
+        if any(_box_iou(line_box, box) > 0.6 for box in arrow_boxes):
+            continue
+        text_regions.append(
+            _pixel_region(
+                f"t{len(text_regions) + 1}",
+                "text",
+                line_box,
+                image_width,
+                image_height,
+                "Detected text line",
+                OPENCV_TEXT_CONFIDENCE,
+            )
+        )
+
+    regions = shape_regions + arrow_regions + text_regions
+    regions.sort(key=lambda region: (region.box[1], region.box[0], region.type))
+    for index, region in enumerate(regions, start=1):
+        region.id = f"r{index}"
+    log.info(
+        "OpenCV detected %s shapes, %s connectors, and %s text lines",
+        len(shape_regions),
+        len(arrow_regions),
+        len(text_regions),
+    )
+    return regions
+
+
+GROUNDING_DINO_PROMPT = (
+    "handwritten text. flowchart box. flowchart arrow. "
+    "flowchart diamond. flowchart circle."
+)
+
+
+def _grounding_region_type(label: str) -> Optional[str]:
+    normalized = label.lower()
+    matches = [
+        (normalized.find(word), region_type)
+        for region_type, words in (
+            ("arrow", ("arrow", "connector")),
+            ("diamond", ("diamond",)),
+            ("circle", ("circle", "oval")),
+            ("table", ("table",)),
+            ("text", ("text", "handwriting", "note")),
+            ("box", ("box", "rectangle", "square")),
+        )
+        for word in words
+        if normalized.find(word) >= 0
+    ]
+    return min(matches)[1] if matches else None
+
+
+def _box_iou(left: List[float], right: List[float]) -> float:
+    x1 = max(left[0], right[0])
+    y1 = max(left[1], right[1])
+    x2 = min(left[2], right[2])
+    y2 = min(left[3], right[3])
+    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    left_area = max(0.0, left[2] - left[0]) * max(0.0, left[3] - left[1])
+    right_area = max(0.0, right[2] - right[0]) * max(0.0, right[3] - right[1])
+    union = left_area + right_area - intersection
+    return intersection / union if union else 0.0
+
+
+def _intersection_over_smaller_box(left: List[float], right: List[float]) -> float:
+    x1 = max(left[0], right[0])
+    y1 = max(left[1], right[1])
+    x2 = min(left[2], right[2])
+    y2 = min(left[3], right[3])
+    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    smaller_area = min(
+        max(0.0, left[2] - left[0]) * max(0.0, left[3] - left[1]),
+        max(0.0, right[2] - right[0]) * max(0.0, right[3] - right[1]),
+    )
+    return intersection / smaller_area if smaller_area else 0.0
+
+
+def _grounding_dino_detect(image_b64: str) -> List[RegionItem]:
+    """Detect whiteboard content with the local, zero-shot Grounding DINO model."""
+    import torch
+
+    if image_b64.startswith("data:") and "," in image_b64:
+        image_b64 = image_b64.split(",", 1)[1]
+    image = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
+    processor, model, device = _get_grounding_dino()
+    inputs = processor(
+        images=image,
+        text=GROUNDING_DINO_PROMPT,
+        return_tensors="pt",
+        size={
+            "shortest_edge": GROUNDING_DINO_IMAGE_SIZE,
+            "longest_edge": int(GROUNDING_DINO_IMAGE_SIZE * 1.6),
+        },
+    ).to(device)
+
+    with torch.inference_mode():
+        outputs = model(**inputs)
+
+    post_process = processor.post_process_grounded_object_detection
+    parameters = inspect.signature(post_process).parameters
+    threshold_args = {
+        "text_threshold": GROUNDING_DINO_TEXT_THRESHOLD,
+        "target_sizes": [(image.height, image.width)],
+    }
+    if "threshold" in parameters:
+        threshold_args["threshold"] = GROUNDING_DINO_THRESHOLD
+    else:
+        threshold_args["box_threshold"] = GROUNDING_DINO_THRESHOLD
+
+    detections = post_process(
+        outputs,
+        inputs.input_ids,
+        **threshold_args,
+    )[0]
+    boxes = detections["boxes"]
+    scores = detections["scores"]
+    labels = detections.get("text_labels")
+    if labels is None:
+        labels = detections["labels"]
+    if hasattr(boxes, "tolist"):
+        boxes = boxes.tolist()
+    if hasattr(scores, "tolist"):
+        scores = scores.tolist()
+    if hasattr(labels, "tolist"):
+        labels = labels.tolist()
+
+    candidates = []
+    for box, score, label in zip(boxes, scores, labels):
+        region_type = _grounding_region_type(str(label))
+        if region_type is None:
+            continue
+
+        x1, y1, x2, y2 = (float(value) for value in box)
+        x1 = min(float(image.width), max(0.0, x1))
+        y1 = min(float(image.height), max(0.0, y1))
+        x2 = min(float(image.width), max(x1, x2))
+        y2 = min(float(image.height), max(y1, y2))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        area_ratio = (x2 - x1) * (y2 - y1) / (image.width * image.height)
+        if region_type != "text" and area_ratio > 0.85:
+            continue
+        candidates.append((float(score), str(label), region_type, [x1, y1, x2, y2]))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    regions: List[RegionItem] = []
+    accepted: List[Tuple[str, List[float]]] = []
+    for score, label, region_type, box in candidates:
+        if any(
+            _box_iou(box, accepted_box) > 0.65
+            or (
+                region_type != accepted_type
+                and region_type != "text"
+                and accepted_type != "text"
+                and _intersection_over_smaller_box(box, accepted_box) > 0.7
+            )
+            for accepted_type, accepted_box in accepted
+        ):
+            continue
+        accepted.append((region_type, box))
+        x1, y1, x2, y2 = box
+        regions.append(
+            RegionItem(
+                id=f"r{len(regions) + 1}",
+                type=region_type,
+                box=[
+                    round(x1 / image.width * 100, 2),
+                    round(y1 / image.height * 100, 2),
+                    round((x2 - x1) / image.width * 100, 2),
+                    round((y2 - y1) / image.height * 100, 2),
+                ],
+                label=label,
+                confidence=round(score, 3),
+            )
+        )
+
+    log.info("Grounding DINO detected %s regions", len(regions))
+    return regions
 
 
 def _roboflow_detect(image_b64: str, model_id: str, api_key: str) -> List[RegionItem]:
-    """Call the BoardSnap YOLO-World workflow on Roboflow."""
+    """Call the configured hosted Roboflow Workflow."""
     import requests
 
     if not ROBOFLOW_WORKFLOW_URL:
@@ -311,7 +769,7 @@ def _roboflow_detect(image_b64: str, model_id: str, api_key: str) -> List[Region
 
     if not resp.ok:
         log.error(
-            "YOLO-World workflow HTTP %s: %s",
+            "Roboflow workflow HTTP %s: %s",
             resp.status_code,
             resp.text[:1000],
         )
@@ -336,7 +794,7 @@ def _roboflow_detect(image_b64: str, model_id: str, api_key: str) -> List[Region
 
     if not isinstance(predictions, list):
         raise ValueError("Roboflow workflow response is missing a predictions list")
-    log.info("YOLO-World prediction count: %s", len(predictions))
+    log.info("Roboflow workflow prediction count: %s", len(predictions))
 
     img_w = img_info.get("width", 1) or 1
     img_h = img_info.get("height", 1) or 1
@@ -385,7 +843,7 @@ def _roboflow_detect(image_b64: str, model_id: str, api_key: str) -> List[Region
             )
         )
 
-    log.info("YOLO-World detected %s regions", len(regions))
+    log.info("Roboflow workflow detected %s regions", len(regions))
     return regions
 
 
@@ -488,7 +946,7 @@ def _ocr_regions(
     img_w, img_h = pil_img.size
 
     for r in regions:
-        if r.get("type") not in ("text", "box", "parallelogram"):
+        if r.get("type") not in ("text", "box", "circle", "diamond", "table", "parallelogram"):
             continue
         if not isinstance(r.get("box"), (list, tuple)) or len(r["box"]) != 4:
             raise ValueError(f"Region {r.get('id', '<unknown>')} has an invalid box")
@@ -538,7 +996,10 @@ def _build_graph(regions: List[Dict[str, Any]]) -> Tuple[list, list, str]:
     Connect arrows to the nearest box/text on each side.
     Returns (nodes, edges, mermaid_string).
     """
-    shapes = [r for r in regions if r["type"] in ("box", "text", "parallelogram", "diamond")]
+    shapes = [
+        r for r in regions
+        if r["type"] in ("box", "text", "circle", "table", "parallelogram", "diamond")
+    ]
     arrows = [r for r in regions if r["type"] == "arrow"]
 
     # Assign clean IDs to shapes
@@ -579,6 +1040,8 @@ def _build_graph(regions: List[Dict[str, Any]]) -> Tuple[list, list, str]:
         shape = n["shape"]
         if shape == "diamond":
             mermaid_lines.append(f'    {n["id"]}{{"{label}"}}')
+        elif shape == "circle":
+            mermaid_lines.append(f'    {n["id"]}(("{label}"))')
         elif shape == "parallelogram":
             mermaid_lines.append(f'    {n["id"]}[/"{label}"/]')
         else:
@@ -601,12 +1064,34 @@ def _build_graph(regions: List[Dict[str, Any]]) -> Tuple[list, list, str]:
 
 @app.get("/health")
 def health():
+    if DETECTOR_PROVIDER == "opencv":
+        detector_model = "opencv-contours-hough-lines"
+        detector_configured = True
+        detector_loaded = True
+    elif DETECTOR_PROVIDER == "grounding-dino":
+        detector_model = GROUNDING_DINO_MODEL_ID
+        detector_configured = bool(
+            importlib.util.find_spec("torch")
+            and importlib.util.find_spec("transformers")
+        )
+        detector_loaded = _grounding_dino_model is not None
+    elif DETECTOR_PROVIDER == "roboflow":
+        detector_model = ROBOFLOW_MODEL_ID
+        detector_configured = bool(ROBOFLOW_API_KEY and ROBOFLOW_WORKFLOW_URL)
+        detector_loaded = detector_configured
+    else:
+        detector_model = ""
+        detector_configured = False
+        detector_loaded = False
+
     return {
         "status": "ok",
         "service": "BoardSnap Vision & ML Service",
         "detector": {
-            "provider": "Roboflow Hosted Workflow (YOLO-World)",
-            "configured": bool(ROBOFLOW_API_KEY and ROBOFLOW_WORKFLOW_URL),
+            "provider": DETECTOR_PROVIDER,
+            "model": detector_model,
+            "configured": detector_configured,
+            "model_loaded": detector_loaded,
             "fallback_enabled": ALLOW_DEMO_DETECTOR_FALLBACK,
         },
         "ocr": {
@@ -663,8 +1148,8 @@ async def detect_regions(
       - multipart file upload  (raw or cleaned image)
       - clean_image_b64        (base64 string from /vision/clean response)
 
-    Calls the configured Roboflow hosted workflow. Demo regions are only
-    returned when ALLOW_DEMO_DETECTOR_FALLBACK=true is explicitly set.
+    Uses OpenCV by default, or Grounding DINO/Roboflow when explicitly selected.
+    Demo regions are only returned when ALLOW_DEMO_DETECTOR_FALLBACK=true.
     """
     if file is not None:
         raw = await file.read()
@@ -673,6 +1158,34 @@ async def detect_regions(
         image_b64 = clean_image_b64
     else:
         raise HTTPException(status_code=422, detail="Provide file or clean_image_b64")
+
+    if DETECTOR_PROVIDER == "opencv":
+        try:
+            regions = _opencv_detect(image_b64)
+        except Exception as exc:
+            log.exception("OpenCV region detection failed")
+            raise HTTPException(
+                status_code=422,
+                detail="OpenCV could not detect regions in the submitted image.",
+            ) from exc
+        return {"regions": [region.model_dump() for region in regions], "source": "opencv"}
+
+    if DETECTOR_PROVIDER == "grounding-dino":
+        try:
+            regions = _grounding_dino_detect(image_b64)
+        except Exception as exc:
+            log.exception("Local Grounding DINO inference failed")
+            raise HTTPException(
+                status_code=503,
+                detail="Local detector failed to load or process the image. Check model access and Vision logs.",
+            ) from exc
+        return {"regions": [r.model_dump() for r in regions], "source": "grounding-dino"}
+
+    if DETECTOR_PROVIDER != "roboflow":
+        raise HTTPException(
+            status_code=503,
+            detail="Unsupported detector provider. Set DETECTOR_PROVIDER to opencv, grounding-dino, or roboflow.",
+        )
 
     if not ROBOFLOW_API_KEY or not ROBOFLOW_WORKFLOW_URL:
         if ALLOW_DEMO_DETECTOR_FALLBACK:

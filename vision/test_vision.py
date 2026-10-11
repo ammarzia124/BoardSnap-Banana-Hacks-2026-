@@ -48,8 +48,120 @@ class VisionTests(unittest.TestCase):
         self.assertEqual(regions[0].type, "text")
         self.assertEqual(regions[0].box, [5.0, 12.5, 30.0, 25.0])
 
+    def test_local_grounding_dino_normalizes_and_deduplicates_regions(self):
+        class FakeInputs(dict):
+            def to(self, device):
+                return self
+
+            @property
+            def input_ids(self):
+                return self["input_ids_value"]
+
+        class FakeProcessor:
+            def __call__(self, **kwargs):
+                return FakeInputs(pixel_values="pixels", input_ids_value="tokens")
+
+            def post_process_grounded_object_detection(
+                self,
+                outputs,
+                input_ids,
+                threshold=0.25,
+                text_threshold=0.25,
+                target_sizes=None,
+            ):
+                return [{
+                    "boxes": [
+                        [0, 0, 100, 80],
+                        [10, 8, 40, 32],
+                        [11, 9, 39, 31],
+                        [10, 8, 40, 32],
+                        [50, 40, 100, 80],
+                    ],
+                    "scores": [0.98, 0.9, 0.8, 0.85, 0.7],
+                    "text_labels": [
+                        "flowchart box",
+                        "flowchart box",
+                        "flowchart box",
+                        "flowchart arrow",
+                        "handwritten text",
+                    ],
+                }]
+
+        model = Mock(return_value=Mock())
+        with patch.object(main, "_get_grounding_dino", return_value=(FakeProcessor(), model, "cpu")):
+            regions = main._grounding_dino_detect(self.image_base64())
+
+        self.assertEqual(len(regions), 2)
+        self.assertEqual(regions[0].type, "box")
+        self.assertEqual(regions[0].box, [10.0, 10.0, 30.0, 30.0])
+        self.assertEqual(regions[1].type, "text")
+        self.assertEqual(regions[1].box, [50.0, 50.0, 50.0, 50.0])
+
+    def test_grounding_label_uses_first_matching_class(self):
+        self.assertEqual(
+            main._grounding_region_type("flowchart boxchart arrowchart diamond"),
+            "box",
+        )
+
+    def test_opencv_detect_finds_flowchart_shapes_connector_and_text(self):
+        image = np.full((360, 640, 3), 255, dtype=np.uint8)
+        cv2 = main.cv2
+        cv2.rectangle(image, (40, 120), (190, 220), (0, 0, 0), 3)
+        cv2.rectangle(image, (430, 120), (580, 220), (0, 0, 0), 3)
+        cv2.putText(image, "Architecture", (245, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+        cv2.putText(image, "START", (70, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+        cv2.putText(image, "FINISH", (450, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+        cv2.line(image, (193, 170), (420, 170), (0, 0, 0), 2)
+        cv2.line(image, (420, 170), (408, 160), (0, 0, 0), 2)
+        cv2.line(image, (420, 170), (408, 180), (0, 0, 0), 2)
+        success, encoded = cv2.imencode(".png", image)
+        self.assertTrue(success)
+        image_b64 = base64.b64encode(encoded.tobytes()).decode("ascii")
+
+        regions = main._opencv_detect(image_b64)
+        region_types = [region.type for region in regions]
+
+        self.assertGreaterEqual(region_types.count("box"), 2)
+        self.assertIn("arrow", region_types)
+        self.assertIn("text", region_types)
+        self.assertTrue(
+            all(region.box[2] < 80 for region in regions if region.type == "text")
+        )
+        graph_regions = [
+            region.model_dump()
+            for region in regions
+            if region.type in ("box", "arrow")
+        ]
+        nodes, edges, mermaid = main._build_graph(graph_regions)
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(len(edges), 1)
+        self.assertIn("graph LR", mermaid)
+
+    def test_detect_endpoint_uses_opencv_default_provider(self):
+        with (
+            patch.object(main, "DETECTOR_PROVIDER", "opencv"),
+            patch.object(main, "_opencv_detect", return_value=[]),
+        ):
+            result = asyncio.run(
+                main.detect_regions(file=None, clean_image_b64=self.image_base64())
+            )
+
+        self.assertEqual(result, {"regions": [], "source": "opencv"})
+
+    def test_detect_endpoint_uses_local_provider_without_roboflow_config(self):
+        with (
+            patch.object(main, "DETECTOR_PROVIDER", "grounding-dino"),
+            patch.object(main, "_grounding_dino_detect", return_value=[]),
+        ):
+            result = asyncio.run(
+                main.detect_regions(file=None, clean_image_b64=self.image_base64())
+            )
+
+        self.assertEqual(result, {"regions": [], "source": "grounding-dino"})
+
     def test_detector_requires_configuration_instead_of_fake_regions(self):
         with (
+            patch.object(main, "DETECTOR_PROVIDER", "roboflow"),
             patch.object(main, "ROBOFLOW_API_KEY", ""),
             patch.object(main, "ROBOFLOW_WORKFLOW_URL", ""),
             patch.object(main, "ALLOW_DEMO_DETECTOR_FALLBACK", False),
@@ -61,6 +173,7 @@ class VisionTests(unittest.TestCase):
 
     def test_detector_request_failure_is_reported_as_gateway_error(self):
         with (
+            patch.object(main, "DETECTOR_PROVIDER", "roboflow"),
             patch.object(main, "ROBOFLOW_API_KEY", "test-secret"),
             patch.object(main, "ROBOFLOW_WORKFLOW_URL", "https://example.invalid/workflow"),
             patch.object(main, "_roboflow_detect", side_effect=RuntimeError("upstream unavailable")),
@@ -78,6 +191,16 @@ class VisionTests(unittest.TestCase):
             result = main._ocr_regions(regions, self.image_base64())
         self.assertEqual(result[0]["text"], "Written words")
         self.assertEqual(result[0]["label"], "Written words")
+        read.assert_called_once()
+
+    def test_ocr_reads_text_inside_diagram_shapes(self):
+        regions = [{
+            "id": "r1", "type": "diamond", "box": [10, 10, 30, 20],
+            "label": "flowchart diamond", "confidence": 0.9,
+        }]
+        with patch.object(main, "_trocr_read", return_value="Decision") as read:
+            result = main._ocr_regions(regions, self.image_base64())
+        self.assertEqual(result[0]["text"], "Decision")
         read.assert_called_once()
 
     def test_ocr_recognizes_multiline_region_as_separate_lines(self):
@@ -163,6 +286,17 @@ class VisionTests(unittest.TestCase):
         nodes, _, mermaid = main._build_graph(regions)
         self.assertEqual(nodes[0]["label"], "Start\nProcess")
         self.assertIn("Start<br/>Process", mermaid)
+
+    def test_graph_builder_keeps_circle_and_table_nodes(self):
+        regions = [
+            {"id": "circle1", "type": "circle", "box": [5, 20, 20, 20], "label": "Start"},
+            {"id": "table1", "type": "table", "box": [55, 20, 20, 20], "label": "Results"},
+            {"id": "arrow1", "type": "arrow", "box": [35, 27, 10, 5], "label": "next"},
+        ]
+        nodes, edges, mermaid = main._build_graph(regions)
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(len(edges), 1)
+        self.assertIn('N0(("Start"))', mermaid)
 
 
 if __name__ == "__main__":

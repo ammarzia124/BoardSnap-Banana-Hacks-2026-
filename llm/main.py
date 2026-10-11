@@ -1,7 +1,7 @@
 
 import os
 import json
-import google.generativeai as genai
+from google import genai
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -11,10 +11,8 @@ from typing import List, Dict, Any, Optional
 load_dotenv()
 
 API_KEY = os.getenv("GEMINI_API_KEY")
-if API_KEY:
-    genai.configure(api_key=API_KEY)
-
-MODEL_NAME = "gemini-3.8-flash"
+MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-3.8-flash").strip()
+gemini_client = genai.Client(api_key=API_KEY) if API_KEY else None
 
 app = FastAPI(title="BoardSnap LLM Service", version="1.0.0")
 
@@ -38,17 +36,17 @@ class ChatRequest(BaseModel):
 
 def generate_json(prompt: str) -> Any:
     """Ask Gemini for a JSON response."""
-    if not API_KEY:
+    if gemini_client is None:
         raise HTTPException(
-            status_code=500,
+            status_code=503,
             detail="GEMINI_API_KEY is missing from the LLM environment."
         )
 
     try:
-        model = genai.GenerativeModel(MODEL_NAME)
-        response = model.generate_content(
-            prompt,
-            generation_config={
+        response = gemini_client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+            config={
                 "response_mime_type": "application/json",
                 "temperature": 0.2,
             },
@@ -100,7 +98,8 @@ def health():
     return {
         "status": "ok",
         "service": "BoardSnap LLM Grounded Service",
-        "gemini_configured": bool(API_KEY),
+        "gemini_configured": gemini_client is not None,
+        "gemini_model": MODEL_NAME,
     }
 
 
